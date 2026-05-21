@@ -1,12 +1,7 @@
-//
-//  ContentView.swift
-//  AT YARIŞI HD — Yatay Hipodrom · Kayan Kamera · Bulut Parallaksı
-//
-//  iOS 16+ · SwiftUI · 100 At Havuzu · Light Mode
-//
-
 import SwiftUI
 import UIKit
+import GameKit
+import Combine
 
 // MARK: - TEMA
 
@@ -70,7 +65,50 @@ enum HorseTier: Int, CaseIterable {
     }
 }
 
-enum AppState { case padock, racing, result, bankrupt }
+// Feature 4 + Cheat system
+enum AppState { case padock, racing, result, bankrupt, hardGameOver, cheatingCaught }
+
+// MARK: - HİLE SİSTEMİ
+
+enum CheatType: CaseIterable, Identifiable {
+    case sugarFeed       // Ata çaktırmadan şeker yedir
+    case illegalCoupon   // Seyise yasaklı iddia kuponu ver
+    case bribeJockey     // Jokeye rüşvet teklif et
+
+    var id: Self { self }
+
+    var emoji: String {
+        switch self {
+        case .sugarFeed:     return "🍬"
+        case .illegalCoupon: return "🎫"
+        case .bribeJockey:   return "💵"
+        }
+    }
+    var label: String {
+        switch self {
+        case .sugarFeed:     return "Ata çaktırmadan şeker yedir"
+        case .illegalCoupon: return "Seyise yasaklı iddia kuponu ver"
+        case .bribeJockey:   return "Jokeye rüşvet teklif et"
+        }
+    }
+    var boostLabel: String {
+        switch self {
+        case .sugarFeed:     return "+%20 şans"
+        case .illegalCoupon: return "+%10 şans"
+        case .bribeJockey:   return "+%25 şans"
+        }
+    }
+    /// Final score multiplier bonus (additive on top of 1.0)
+    var boost: Double {
+        switch self {
+        case .sugarFeed:     return 0.20
+        case .illegalCoupon: return 0.10
+        case .bribeJockey:   return 0.25
+        }
+    }
+    /// 25% risk of getting caught for all cheat types
+    static let catchRisk: Double = 0.25
+}
 
 enum TrackSurface: CaseIterable {
     case grass, sand
@@ -152,11 +190,11 @@ struct Horse: Identifiable, Equatable {
 
     var progress: Double = 0
     var hasBoomed: Bool = false
-    var yOffset: CGFloat = 0       // boom efektleri için
-    var runBob: CGFloat = 0        // koşu animasyonu için
+    var yOffset: CGFloat = 0
+    var runBob: CGFloat = 0
     var rotation: Double = 0
     var emojiOverride: String? = nil
-    var gallopPhase: Int = 0       // 0/1 — koşu animasyon karesi
+    var gallopPhase: Int = 0
 
     var baseAsset: Double {
         Double(speed) * 0.40 + Double(health) * 0.25
@@ -171,19 +209,41 @@ struct Horse: Identifiable, Equatable {
 
 struct CloudSprite: Identifiable {
     let id = UUID()
-    var worldX: Double    // bulut katmanındaki x (0..1)
-    var y: CGFloat        // gökyüzü içinde y
+    var worldX: Double
+    var y: CGFloat
     var scale: CGFloat
-    var parallax: Double  // kameraya göre kayma oranı (0..1)
+    var parallax: Double
     var emoji: String
 }
 
 // MARK: - GAME ENGINE
+// Feature 1: Persistent storage via Combine sinks → UserDefaults
+// Feature 2: Statistics tracking
+// Feature 5: Game Center authentication & leaderboard
+
+private let kBalance       = "gy_balance"
+private let kDebt          = "gy_debt"
+private let kTotalWins     = "gy_totalWins"
+private let kTotalLosses   = "gy_totalLosses"
+private let kMoneyWon      = "gy_totalMoneyWon"
+private let kMoneyLost     = "gy_totalMoneyLost"
+private let kBiggestWin    = "gy_biggestWin"
+private let kBiggestLoss   = "gy_biggestLoss"
 
 final class GameEngine: ObservableObject {
+    // Feature 1: Published + Combine-persisted
+    @Published var balance: Double
+    @Published var debt: Double
+
+    // Feature 2: Stats
+    @Published var totalWins: Int
+    @Published var totalLosses: Int
+    @Published var totalMoneyWon: Double
+    @Published var totalMoneyLost: Double
+    @Published var biggestWin: Double
+    @Published var biggestLoss: Double
+
     @Published var state: AppState = .padock
-    @Published var balance: Double = 100.0
-    @Published var debt: Double = 0.0
     @Published var horses: [Horse] = []
     @Published var selectedHorseId: UUID? = nil
     @Published var betAmount: Double = 5.0
@@ -200,11 +260,17 @@ final class GameEngine: ObservableObject {
 
     @Published var trackSurface: TrackSurface = .grass
     @Published var clouds: [CloudSprite] = []
-    @Published var cameraProgress: Double = 0   // 0..1 — kamera ilerleyişi
+    @Published var cameraProgress: Double = 0
+
+    // Cheat system
+    @Published var selectedCheat: CheatType? = nil
+    @Published var caughtCheating: Bool = false
 
     private var timer: Timer?
     private let raceDuration: Double = 14.0
     private var lastCommentaryTime: Double = -10
+    // Combine cancellables for persistence
+    private var cancellables = Set<AnyCancellable>()
 
     private static let boomReasonsByKind: [Horse.BoomKind: [String]] = [
         .spin: ["kendi etrafında döndü, jokey fenalaştı!","midyeciyi gördü, dans etmeye başladı!","kuyruğunu kovalamaya kalktı!","yere bayrak diktiğini sandı!","şampiyonluk turunu önden attı!"],
@@ -216,16 +282,76 @@ final class GameEngine: ObservableObject {
     ]
 
     init() {
+        // Feature 1: Load persisted values
+        let ud = UserDefaults.standard
+        let savedBalance = ud.double(forKey: kBalance)
+        balance        = savedBalance > 0 ? savedBalance : 100.0
+        debt           = max(0, ud.double(forKey: kDebt))
+        totalWins      = ud.integer(forKey: kTotalWins)
+        totalLosses    = ud.integer(forKey: kTotalLosses)
+        totalMoneyWon  = ud.double(forKey: kMoneyWon)
+        totalMoneyLost = ud.double(forKey: kMoneyLost)
+        biggestWin     = ud.double(forKey: kBiggestWin)
+        biggestLoss    = ud.double(forKey: kBiggestLoss)
+
         drawRaceField()
         generateClouds()
+
+        // Feature 1: Persist changes via Combine
+        $balance.dropFirst().sink       { ud.set($0, forKey: kBalance) }.store(in: &cancellables)
+        $debt.dropFirst().sink          { ud.set($0, forKey: kDebt) }.store(in: &cancellables)
+        $totalWins.dropFirst().sink     { ud.set($0, forKey: kTotalWins) }.store(in: &cancellables)
+        $totalLosses.dropFirst().sink   { ud.set($0, forKey: kTotalLosses) }.store(in: &cancellables)
+        $totalMoneyWon.dropFirst().sink { ud.set($0, forKey: kMoneyWon) }.store(in: &cancellables)
+        $totalMoneyLost.dropFirst().sink{ ud.set($0, forKey: kMoneyLost) }.store(in: &cancellables)
+        $biggestWin.dropFirst().sink    { ud.set($0, forKey: kBiggestWin) }.store(in: &cancellables)
+        $biggestLoss.dropFirst().sink   { ud.set($0, forKey: kBiggestLoss) }.store(in: &cancellables)
+
+        // Feature 5: Game Center
+        authenticateGameCenter()
     }
 
     deinit { timer?.invalidate() }
 
+    // MARK: Feature 4: Hard reset (wipes all game data)
+    func hardReset() {
+        let ud = UserDefaults.standard
+        [kBalance, kDebt, kTotalWins, kTotalLosses,
+         kMoneyWon, kMoneyLost, kBiggestWin, kBiggestLoss].forEach { ud.removeObject(forKey: $0) }
+        balance = 100.0; debt = 0.0
+        totalWins = 0; totalLosses = 0
+        totalMoneyWon = 0; totalMoneyLost = 0
+        biggestWin = 0; biggestLoss = 0
+        raceCount = 0; betAmount = 5
+        selectedCheat = nil; caughtCheating = false
+        drawRaceField()
+        commentator = "Padoka hoş geldin. Atını seç, bahsini koy."
+        state = .padock
+    }
+
+    // MARK: Feature 5: Game Center
+    func authenticateGameCenter() {
+        GKLocalPlayer.local.authenticateHandler = { [weak self] _, _ in
+            if GKLocalPlayer.local.isAuthenticated {
+                self?.submitScoreToLeaderboard(balance: self?.balance ?? 100)
+            }
+        }
+    }
+
+    func submitScoreToLeaderboard(balance: Double) {
+        guard GKLocalPlayer.local.isAuthenticated else { return }
+        GKLeaderboard.submitScore(
+            Int(balance), context: 0,
+            player: GKLocalPlayer.local,
+            leaderboardIDs: ["grp.highest_balance"]
+        ) { _ in }
+    }
+
+    // MARK: - Race field
+
     func generateClouds() {
         let emojis = ["☁️","☁️","🌤️","☁️"]
         var arr: [CloudSprite] = []
-        // 9 bulut, dağıtık
         for i in 0..<9 {
             let parallax = Double.random(in: 0.15...0.55)
             arr.append(CloudSprite(
@@ -280,7 +406,8 @@ final class GameEngine: ObservableObject {
         return (Double.random(in: r) * 10).rounded() / 10
     }
 
-    func selectHorse(_ id: UUID) { selectedHorseId = id }
+    func selectHorse(_ id: UUID) { selectedHorseId = id; selectedCheat = nil }
+    func selectCheat(_ cheat: CheatType?) { selectedCheat = cheat }
     func setBet(_ a: Double) {
         var b = a
         if b > balance { b = balance }
@@ -332,6 +459,21 @@ final class GameEngine: ObservableObject {
                 arr[i].finalScore = arr[i].baseAsset * 0.5 + Double.random(in: 1...100) * 0.5
             }
         }
+
+        // Cheat: apply boost to selected horse's finalScore (pre-placement calc)
+        // Caught status is also decided here so it's locked in before race starts
+        caughtCheating = false
+        if let cheat = selectedCheat,
+           let selId = selectedHorseId,
+           let idx = arr.firstIndex(where: { $0.id == selId }) {
+            // Apply boost regardless — whether caught is revealed at finish
+            if arr[idx].finalScore > 0 {
+                arr[idx].finalScore *= (1.0 + cheat.boost)
+            }
+            // Roll the dice: 25% chance of getting caught
+            caughtCheating = Double.random(in: 0..<1) < CheatType.catchRisk
+        }
+
         let sorted = arr.sorted { $0.finalScore > $1.finalScore }
         var pm: [UUID: Int] = [:]
         for (i, h) in sorted.enumerated() { pm[h.id] = i + 1 }
@@ -363,7 +505,6 @@ final class GameEngine: ObservableObject {
                 continue
             }
             if arr[i].progress >= 1.0 {
-                // Bitirenler de hafif sallansın
                 arr[i].runBob = CGFloat(sin(raceTime * 18 + Double(arr[i].lane) * 2.1)) * 0.8
                 continue
             }
@@ -401,7 +542,6 @@ final class GameEngine: ObservableObject {
             candidate = min(candidate, 1.0)
             arr[i].progress = candidate
 
-            // Koşu animasyonu: dikey bob + dönüşümlü kare
             arr[i].runBob = CGFloat(sin(raceTime * 18 + lane * 2.1)) * 1.8
             let phaseDouble = (raceTime * 10 + lane).truncatingRemainder(dividingBy: 2)
             arr[i].gallopPhase = phaseDouble < 1 ? 0 : 1
@@ -409,10 +549,8 @@ final class GameEngine: ObservableObject {
 
         horses = arr
 
-        // Kamera: liderin ilerleyişini takip et (sadece patlayanları sayma)
         let leader = horses.filter { !$0.willBoom }.max(by: { $0.progress < $1.progress })
         let target = leader?.progress ?? 0
-        // Hafif takip lerp
         cameraProgress += (target - cameraProgress) * 0.15
 
         if let b = booming { commentator = b } else { updateLiveCommentary() }
@@ -449,6 +587,19 @@ final class GameEngine: ObservableObject {
         lastCommentaryTime = raceTime
     }
 
+    // Feature 2: Statistics update helper
+    private func recordStats(won: Bool, netAmount: Double) {
+        if won {
+            totalWins += 1
+            totalMoneyWon += netAmount
+            if netAmount > biggestWin { biggestWin = netAmount }
+        } else {
+            totalLosses += 1
+            totalMoneyLost += netAmount
+            if netAmount > biggestLoss { biggestLoss = netAmount }
+        }
+    }
+
     private func finishRace() {
         timer?.invalidate(); timer = nil
         var arr = horses
@@ -472,16 +623,40 @@ final class GameEngine: ObservableObject {
             let recv = gross - dp
             lastGross = gross; lastDebtPayment = dp; lastNetReceived = recv
             balance += recv
+            // Feature 2: record win stat (net profit = recv - bet)
+            recordStats(won: true, netAmount: recv - lastBet)
         } else {
             didWin = false; lastGross = 0; lastDebtPayment = 0; lastNetReceived = 0
+            // Feature 2: record loss stat
+            recordStats(won: false, netAmount: lastBet)
         }
+
+        // Feature 5: Submit score after balance change
+        submitScoreToLeaderboard(balance: balance)
+
         raceFinished = true; raceCount += 1
+
+        // Cheat caught? → override everything, show ban screen
+        if selectedCheat != nil && caughtCheating {
+            commentator = "🚨 HİLE TESPİT EDİLDİ! Bahisçilikten men kararı çıkıyor..."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
+                self?.state = .cheatingCaught
+            }
+            return
+        }
+
+        // Reset cheat selection for next round
+        selectedCheat = nil
+
+        // Feature 4: Route to hardGameOver if debt ≥ 1000
+        let nextState: AppState = debt >= 1000.0 ? .hardGameOver : .result
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
-            self?.state = .result
+            self?.state = nextState
         }
     }
 
     func nextRound() {
+        selectedCheat = nil; caughtCheating = false
         drawRaceField()
         if balance < 5 { state = .bankrupt; return }
         if betAmount > balance { betAmount = balance }
@@ -489,15 +664,25 @@ final class GameEngine: ObservableObject {
         commentator = "Padoka hoş geldin. Atını seç, bahsini koy."
         state = .padock
     }
+
     func shovelManure() {
         balance += 5; drawRaceField(); betAmount = 5
         commentator = "Sırtın ağrıdı, 5 ₺ kazandın. Şansını dene!"
         state = .padock
     }
+
     func takeLoanShark() {
-        balance += 250; debt += 375; drawRaceField()
+        balance += 250; debt += 375
         if betAmount < 5 { betAmount = 5 }
         if betAmount > balance { betAmount = balance }
+        // Feature 4: Hard game over if debt hits 1000+
+        if debt >= 1000.0 {
+            commentator = "Tefeci Rıza pisti devraldı. Borç 1000 ₺'yi geçti!"
+            drawRaceField()
+            state = .hardGameOver
+            return
+        }
+        drawRaceField()
         commentator = "Tefeci Rıza parayı verdi. Şimdi koş bakalım..."
         state = .padock
     }
@@ -513,10 +698,12 @@ struct ContentView: View {
             Theme.bg.ignoresSafeArea()
             Group {
                 switch engine.state {
-                case .padock:   PadockView()
-                case .racing:   RaceTrackView()
-                case .result:   ResultView()
-                case .bankrupt: BankruptView()
+                case .padock:         PadockView()
+                case .racing:         RaceTrackView()
+                case .result:         ResultView()
+                case .bankrupt:       BankruptView()
+                case .hardGameOver:   HardGameOverView()
+                case .cheatingCaught: CheatingCaughtView()
                 }
             }
             .environmentObject(engine)
@@ -524,11 +711,13 @@ struct ContentView: View {
         .preferredColorScheme(.light)
         .onAppear {
             OrientationController.set(.portrait)
+            // Feature 4: restore hard game over state on launch
+            if engine.debt >= 1000.0 { engine.state = .hardGameOver; return }
             if engine.balance < 5 { engine.state = .bankrupt }
         }
         .onChange(of: engine.state) { newState in
             if newState == .racing {
-                OrientationController.set(.landscapeRight)
+                OrientationController.set(.landscape)
             } else {
                 OrientationController.set(.portrait)
             }
@@ -536,7 +725,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - HEADER (dikey ekranlarda)
+// MARK: - HEADER
 
 struct HeaderView: View {
     @EnvironmentObject var engine: GameEngine
@@ -576,18 +765,53 @@ struct HeaderView: View {
 }
 
 // MARK: - PADOK
+// Feature 2 & 5: Stats and Leaderboard buttons
 
 struct PadockView: View {
     @EnvironmentObject var engine: GameEngine
+    @State private var showStats = false           // Feature 2
+    @State private var showLeaderboard = false     // Feature 5
+
     var body: some View {
         VStack(spacing: 0) {
             HeaderView()
-            HStack {
+
+            HStack(spacing: 8) {
                 Text("// PADOK //")
                     .font(.system(size: 12, weight: .heavy, design: .monospaced))
                     .foregroundColor(Theme.grassDark)
                 Spacer()
-                Text("100 ATLIK HAVUZ · 8 KOŞAR")
+
+                // Feature 2: Stats button — prominent, with horse emoji
+                Button(action: { showStats = true }) {
+                    HStack(spacing: 4) {
+                        Text("🐎")
+                            .font(.system(size: 12))
+                        Text("İSTATİSTİK")
+                            .font(.system(size: 10, weight: .black, design: .monospaced))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(Theme.grassDark)
+                    .cornerRadius(5)
+                }
+
+                // Feature 5: Leaderboard button — bigger, gold, trophy
+                Button(action: { showLeaderboard = true }) {
+                    HStack(spacing: 4) {
+                        Text("🏆")
+                            .font(.system(size: 12))
+                        Text("LİDER TABLOSU")
+                            .font(.system(size: 10, weight: .black, design: .monospaced))
+                    }
+                    .foregroundColor(Theme.inkBlack)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(Theme.accentGold.opacity(0.18))
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.accentGold, lineWidth: 1.5))
+                    .cornerRadius(5)
+                }
+
+                Text("100 AT · 8 KOŞAR")
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
                     .foregroundColor(Theme.inkSoft)
             }
@@ -604,7 +828,19 @@ struct PadockView: View {
                 }
                 .padding(.horizontal, 8).padding(.vertical, 8)
             }
+            // Cheat panel appears after horse is selected
+            if engine.selectedHorseId != nil {
+                CheatPanelView()
+            }
             BetPanelView()
+        }
+        // Feature 2: Stats sheet
+        .sheet(isPresented: $showStats) {
+            StatsView().environmentObject(engine)
+        }
+        // Feature 5: Game Center leaderboard sheet
+        .sheet(isPresented: $showLeaderboard) {
+            GameCenterView()
         }
     }
 }
@@ -746,11 +982,9 @@ struct RaceTrackView: View {
         GeometryReader { geo in
             let isLandscape = geo.size.width > geo.size.height
             ZStack(alignment: .topLeading) {
-                // Tam ekran hipodrom
                 HippodromeScene(size: geo.size)
                     .environmentObject(engine)
 
-                // Spiker (üstte yüzer)
                 VStack {
                     HStack {
                         SpikerOverlay()
@@ -797,14 +1031,8 @@ struct SpikerOverlay: View {
                 .multilineTextAlignment(.leading)
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.white.opacity(0.88))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Theme.grassDark.opacity(0.6), lineWidth: 1)
-        )
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.88)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.grassDark.opacity(0.6), lineWidth: 1))
     }
 }
 
@@ -832,7 +1060,7 @@ struct BetInfoChip: View {
     }
 }
 
-// MARK: - HİPODROM SAHNESİ (gökyüzü + zemin + atlar)
+// MARK: - HİPODROM SAHNESİ
 
 struct HippodromeScene: View {
     @EnvironmentObject var engine: GameEngine
@@ -841,30 +1069,23 @@ struct HippodromeScene: View {
     var body: some View {
         let viewW = size.width
         let viewH = size.height
-        // Dünya genişliği: 3x ekran (uzun pist hissi)
         let worldW = viewW * 3.0
-        // Kamera kayması (px): leader'ın dünya üzerindeki konumu - ekranın yarısı
         let leaderX = engine.cameraProgress * (worldW - viewW)
         let cameraX = max(0, min(worldW - viewW, leaderX))
-
-        // Gökyüzü ve zemin oranları
         let skyH = viewH * 0.42
         let groundH = viewH - skyH
 
         ZStack(alignment: .topLeading) {
-            // 1) Gökyüzü gradyanı
             LinearGradient(
                 colors: [Theme.skyTop, Theme.skyMid, Theme.skyHorizon],
                 startPoint: .top, endPoint: .bottom
             )
             .frame(width: viewW, height: skyH)
 
-            // 2) Bulutlar (parallaks katmanı)
             ZStack(alignment: .topLeading) {
                 ForEach(engine.clouds) { cloud in
-                    let cloudWorldX = cloud.worldX * worldW * 1.4 // bulut katmanı daha geniş
+                    let cloudWorldX = cloud.worldX * worldW * 1.4
                     let cx = cloudWorldX - cameraX * cloud.parallax
-                    // Sonsuz wrap: ekran dışına çıkanı diğer taraftan getir
                     let wrapped = wrap(cx, mod: viewW * 1.5)
                     Text(cloud.emoji)
                         .font(.system(size: 32 * cloud.scale))
@@ -875,19 +1096,16 @@ struct HippodromeScene: View {
             .frame(width: viewW, height: skyH)
             .clipped()
 
-            // 3) Güneş
             Circle()
                 .fill(LinearGradient(colors: [Color.yellow.opacity(0.95), Color.orange.opacity(0.6)],
                                      startPoint: .top, endPoint: .bottom))
                 .frame(width: 38, height: 38)
                 .position(x: viewW - 60, y: 36)
 
-            // 4) Ufuk silüeti (tribün şeridi) — orta parallaks
             HorizonStrip(width: viewW, cameraX: cameraX, worldW: worldW)
                 .frame(width: viewW, height: 14)
                 .position(x: viewW / 2, y: skyH - 7)
 
-            // 5) Zemin: pist
             ZStack(alignment: .topLeading) {
                 Rectangle()
                     .fill(LinearGradient(
@@ -896,7 +1114,6 @@ struct HippodromeScene: View {
                     ))
                     .frame(width: viewW, height: groundH)
 
-                // Pist (kayan, kamera ile)
                 TrackArea(size: CGSize(width: viewW, height: groundH),
                           worldW: worldW, cameraX: cameraX)
                     .environmentObject(engine)
@@ -917,7 +1134,6 @@ struct HorizonStrip: View {
     let cameraX: CGFloat
     let worldW: CGFloat
     var body: some View {
-        // Tribün şeridi — uzaktaki bayraklı çit
         Canvas { ctx, size in
             let parallax: CGFloat = 0.55
             let offset = cameraX * parallax
@@ -931,7 +1147,6 @@ struct HorizonStrip: View {
                     ? Color(red: 0.78, green: 0.20, blue: 0.20)
                     : Color(red: 0.95, green: 0.95, blue: 0.95)
                 ctx.fill(Path(bayrakRect), with: .color(col.opacity(0.85)))
-                // Çit direği
                 let direk = CGRect(x: x + segW/2 - 1, y: h * 0.6, width: 2, height: h * 0.4)
                 ctx.fill(Path(direk), with: .color(.black.opacity(0.55)))
                 x += segW
@@ -941,18 +1156,24 @@ struct HorizonStrip: View {
     }
 }
 
+// MARK: - TRACK AREA
+// Feature 3: Dynamic Island / notch clearance in landscape (.padding(.leading, 50) on lane labels)
+
 struct TrackArea: View {
     @EnvironmentObject var engine: GameEngine
     let size: CGSize
     let worldW: CGFloat
     let cameraX: CGFloat
 
+    // Feature 3: leading inset to clear Dynamic Island / notch in landscape
+    private let diSafeInset: CGFloat = 50
+
     var body: some View {
         let viewW = size.width
         let h = size.height
         let laneCount = max(engine.horses.count, 1)
         let laneH = h / CGFloat(laneCount)
-        let trackStartWorld: CGFloat = viewW * 0.10   // başlangıç kapısı dünya pozisyonu
+        let trackStartWorld: CGFloat = viewW * 0.10
         let trackEndWorld: CGFloat = worldW - viewW * 0.10
         let trackLen = trackEndWorld - trackStartWorld
 
@@ -965,7 +1186,7 @@ struct TrackArea: View {
                     .offset(y: CGFloat(i) * laneH)
             }
 
-            // Mesafe çubukları (her 100m işareti gibi)
+            // Mesafe çubukları
             Canvas { ctx, size in
                 let interval: CGFloat = viewW * 0.35
                 var wx: CGFloat = trackStartWorld
@@ -975,7 +1196,6 @@ struct TrackArea: View {
                     if sx > -10 && sx < size.width + 10 {
                         let r = CGRect(x: sx, y: 0, width: 1, height: size.height)
                         ctx.fill(Path(r), with: .color(.white.opacity(0.35)))
-                        // Mesafe rakamı
                         let txt = Text("\(n*100)m")
                             .font(.system(size: 8, weight: .bold, design: .monospaced))
                             .foregroundColor(.black.opacity(0.45))
@@ -990,43 +1210,44 @@ struct TrackArea: View {
 
             // Başlangıç kapısı
             startingGate(at: trackStartWorld, cameraX: cameraX, h: h)
-            // Bitiş çizgisi (kareli)
+            // Bitiş çizgisi
             finishLine(at: trackEndWorld, cameraX: cameraX, h: h)
 
-            // Şerit isim etiketleri (sol tarafta, sabit)
+            // Feature 3: Şerit isim etiketleri — Dynamic Island clearance
+            // Background covers full panel width (diSafeInset + labelWidth)
+            // Text starts after the safe inset
             VStack(spacing: 0) {
                 ForEach(Array(engine.horses.enumerated()), id: \.element.id) { idx, horse in
                     HStack(spacing: 4) {
                         Text("\(idx + 1)")
                             .font(.system(size: 10, weight: .black, design: .monospaced))
                             .foregroundColor(.white)
-                            .frame(width: 14)
+                            .frame(width: 16)
                             .background(horse.tier.color)
                             .cornerRadius(3)
                         Text(horse.name)
-                            .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                            .font(.system(size: 10, weight: .heavy, design: .monospaced))
                             .foregroundColor(Theme.inkBlack)
                             .lineLimit(1).minimumScaleFactor(0.7)
                         Spacer()
                     }
-                    .padding(.horizontal, 4)
+                    .padding(.leading, diSafeInset)   // clear DI/notch
+                    .padding(.trailing, 4)
                     .frame(height: laneH, alignment: .center)
                     .background(Color.white.opacity(0.55))
                 }
             }
-            .frame(width: 88, height: h)
+            .frame(width: diSafeInset + 92, height: h)   // total width = inset + label area
 
-            // Atlar (dünya konumlu)
+            // Atlar
             ForEach(Array(engine.horses.enumerated()), id: \.element.id) { idx, horse in
                 let worldX = trackStartWorld + trackLen * CGFloat(horse.progress)
                 let sx = worldX - cameraX
                 let cy = CGFloat(idx) * laneH + laneH / 2
-                // Gölge
                 Ellipse()
                     .fill(Color.black.opacity(0.18))
                     .frame(width: 26, height: 6)
                     .position(x: sx, y: cy + 12)
-                // At
                 Text(horse.emojiOverride ?? "🐎")
                     .font(.system(size: 22 + (horse.gallopPhase == 1 ? 1 : 0)))
                     .rotationEffect(.degrees(horse.rotation))
@@ -1045,10 +1266,7 @@ struct TrackArea: View {
             Rectangle()
                 .fill(Color.white)
                 .frame(width: 4, height: h)
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.black.opacity(0.6), lineWidth: 1)
-                )
+                .overlay(Rectangle().stroke(Color.black.opacity(0.6), lineWidth: 1))
                 .position(x: sx, y: h / 2)
             Text("BAŞ")
                 .font(.system(size: 8, weight: .black, design: .monospaced))
@@ -1243,6 +1461,324 @@ struct BankruptView: View {
         }
     }
 }
+
+// MARK: - HİLE PANELİ
+
+struct CheatPanelView: View {
+    @EnvironmentObject var engine: GameEngine
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("🎭")
+                    .font(.system(size: 13))
+                Text("HİLE YAPMAK İSTER MİSİN?")
+                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                    .foregroundColor(Color(red: 0.55, green: 0.10, blue: 0.55))
+                Spacer()
+                Text("%25 YAKALANMA RİSKİ")
+                    .font(.system(size: 8, weight: .heavy, design: .monospaced))
+                    .foregroundColor(Theme.accentRed)
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .background(Theme.accentRed.opacity(0.10))
+                    .cornerRadius(3)
+            }
+            .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 6)
+
+            // Clean play option
+            CheatOptionRow(
+                emoji: "😇",
+                label: "Temiz Oyna",
+                boostLabel: "hile yok",
+                boostColor: Theme.goodGreen,
+                isSelected: engine.selectedCheat == nil
+            ) { engine.selectCheat(nil) }
+
+            // Cheat options
+            ForEach(CheatType.allCases) { cheat in
+                CheatOptionRow(
+                    emoji: cheat.emoji,
+                    label: cheat.label,
+                    boostLabel: cheat.boostLabel,
+                    boostColor: Color(red: 0.55, green: 0.10, blue: 0.55),
+                    isSelected: engine.selectedCheat == cheat
+                ) { engine.selectCheat(cheat) }
+            }
+        }
+        .background(Color(red: 0.98, green: 0.94, blue: 0.99))
+        .overlay(
+            VStack {
+                Rectangle().frame(height: 1).foregroundColor(Color(red: 0.75, green: 0.55, blue: 0.78).opacity(0.5))
+                Spacer()
+            }
+        )
+    }
+}
+
+struct CheatOptionRow: View {
+    let emoji: String
+    let label: String
+    let boostLabel: String
+    let boostColor: Color
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Text(isSelected ? "◉" : "○")
+                    .font(.system(size: 14, weight: .heavy, design: .monospaced))
+                    .foregroundColor(isSelected ? boostColor : Theme.inkSoft)
+                Text(emoji).font(.system(size: 14))
+                Text(label)
+                    .font(.system(size: 11, weight: isSelected ? .heavy : .regular, design: .monospaced))
+                    .foregroundColor(isSelected ? Theme.inkBlack : Theme.inkSoft)
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                Spacer()
+                Text(boostLabel)
+                    .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                    .foregroundColor(boostColor)
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .background(boostColor.opacity(0.10))
+                    .cornerRadius(3)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(isSelected ? boostColor.opacity(0.06) : Color.clear)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - HİLEDEN YAKALANDIN EKRANI
+
+struct CheatingCaughtView: View {
+    @EnvironmentObject var engine: GameEngine
+
+    var body: some View {
+        ZStack {
+            Color(red: 0.10, green: 0.05, blue: 0.12).ignoresSafeArea()
+            VStack(spacing: 0) {
+                Spacer()
+
+                // Badge
+                Text("🚨")
+                    .font(.system(size: 80))
+                    .padding(.bottom, 8)
+
+                Text("HİLEDEN YAKALANDIN")
+                    .font(.system(size: 26, weight: .black, design: .monospaced))
+                    .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.bottom, 12)
+
+                VStack(spacing: 10) {
+                    Text("BAHİSÇİLİKTEN MEN EDİLDİN")
+                        .font(.system(size: 15, weight: .heavy, design: .monospaced))
+                        .foregroundColor(Color(red: 1, green: 0.85, blue: 0.30))
+
+                    Text("HİLE HURDA KÖTÜDÜR!")
+                        .font(.system(size: 13, weight: .black, design: .monospaced))
+                        .foregroundColor(.red.opacity(0.85))
+                        .padding(.horizontal, 16).padding(.vertical, 8)
+                        .background(Color.red.opacity(0.15))
+                        .cornerRadius(6)
+
+                    Text("Sabri Abi tutanağı imzaladı.\nKayıtlardan silindin.")
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.55))
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 24)
+
+                Spacer()
+
+                Button(action: { engine.hardReset() }) {
+                    Text("😔  özür dilerim sabri abi")
+                        .font(.system(size: 16, weight: .black, design: .monospaced))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(Color(red: 0.60, green: 0.10, blue: 0.10))
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
+                .padding(.horizontal, 28)
+
+                Text("« Tüm kayıtlar silinir. Sıfır. »")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.30))
+                    .italic()
+                    .padding(.top, 10)
+                    .padding(.bottom, 28)
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Feature 2: İSTATİSTİK EKRANI
+
+struct StatsView: View {
+    @EnvironmentObject var engine: GameEngine
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Modal header
+            HStack {
+                Text("📊 İSTATİSTİK")
+                    .font(.system(size: 16, weight: .black, design: .monospaced))
+                    .foregroundColor(Theme.inkBlack)
+                Spacer()
+                Button(action: { dismiss() }) {
+                    Text("KAPAT")
+                        .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                        .foregroundColor(Theme.accentRed)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Theme.accentRed.opacity(0.08))
+                        .cornerRadius(5)
+                }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 14)
+            .background(Theme.card)
+            .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.line), alignment: .bottom)
+
+            ScrollView {
+                VStack(spacing: 8) {
+                    let total = engine.totalWins + engine.totalLosses
+                    let winRate = total > 0
+                        ? Double(engine.totalWins) / Double(total) * 100
+                        : 0.0
+
+                    statRow("TOPLAM KOŞU",      "\(total)",         Theme.inkBlack)
+                    statRow("GALİBİYET",        "\(engine.totalWins)",  Theme.goodGreen)
+                    statRow("MAĞLUBİYET",       "\(engine.totalLosses)", Theme.accentRed)
+                    statRow("GALİBİYET ORANI",  String(format: "%.1f%%", winRate),
+                            winRate >= 50 ? Theme.goodGreen : Theme.accentRed)
+                    Divider().padding(.vertical, 2)
+                    statRow("TOPLAM NET KAZANÇ",  String(format: "+%.1f ₺", engine.totalMoneyWon),  Theme.goodGreen)
+                    statRow("TOPLAM KAYIP",       String(format: "-%.1f ₺", engine.totalMoneyLost), Theme.accentRed)
+                    statRow("EN BÜYÜK TEK KAZANÇ", String(format: "%.1f ₺", engine.biggestWin),     Theme.accentGold)
+                    statRow("EN BÜYÜK TEK KAYIP",  String(format: "%.1f ₺", engine.biggestLoss),    Theme.accentRed)
+                    Divider().padding(.vertical, 2)
+                    statRow("BAKİYE",   String(format: "%.1f ₺", engine.balance), Theme.grassDark)
+                    statRow("BORÇ",     String(format: "%.1f ₺", engine.debt),
+                            engine.debt > 0 ? Theme.accentRed : Theme.inkSoft)
+                }
+                .padding(14)
+            }
+        }
+        .background(Theme.bg.ignoresSafeArea())
+        .preferredColorScheme(.light)
+    }
+
+    private func statRow(_ label: String, _ value: String, _ color: Color) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(Theme.inkSoft)
+            Spacer()
+            Text(value)
+                .font(.system(size: 14, weight: .heavy, design: .monospaced))
+                .foregroundColor(color)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(Theme.card)
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.line, lineWidth: 1))
+        .cornerRadius(6)
+    }
+}
+
+// MARK: - Feature 4: HARD GAME OVER
+
+struct HardGameOverView: View {
+    @EnvironmentObject var engine: GameEngine
+
+    var body: some View {
+        ZStack {
+            Theme.bg.ignoresSafeArea()
+            VStack(spacing: 0) {
+                Spacer()
+
+                // Rıza illustration
+                Text("🕴️")
+                    .font(.system(size: 90))
+                    .padding(.bottom, 8)
+
+                Text("OYUN BİTTİ")
+                    .font(.system(size: 36, weight: .black, design: .monospaced))
+                    .foregroundColor(Theme.accentRed)
+                    .padding(.bottom, 12)
+
+                VStack(spacing: 8) {
+                    Text("Tefeci Rıza pisti devraldı.")
+                        .font(.system(size: 16, weight: .heavy, design: .monospaced))
+                        .foregroundColor(Theme.inkBlack)
+                    Text(String(format: "Toplam borç: %.1f ₺", engine.debt))
+                        .font(.system(size: 14, weight: .heavy, design: .monospaced))
+                        .foregroundColor(Theme.accentRed)
+                    Text("Bundan sonrası senin bileceğin iş.")
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundColor(Theme.inkSoft)
+                }
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 32)
+
+                Spacer()
+
+                // Reset button
+                Button(action: { engine.hardReset() }) {
+                    Text("🔄 HERŞEYİ SIFIRLA")
+                        .font(.system(size: 18, weight: .black, design: .monospaced))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(
+                            LinearGradient(
+                                colors: [Theme.accentRed, Color(red: 0.50, green: 0.05, blue: 0.05)],
+                                startPoint: .top, endPoint: .bottom
+                            )
+                        )
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
+                .padding(.horizontal, 28)
+
+                Text("« Tüm kayıtlar silinir. Taze başlangıç. »")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(Theme.inkSoft)
+                    .italic()
+                    .padding(.top, 12)
+                    .padding(.bottom, 28)
+            }
+        }
+        .preferredColorScheme(.light)
+    }
+}
+
+// MARK: - Feature 5: GAME CENTER
+
+struct GameCenterView: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> GKGameCenterViewController {
+        let vc = GKGameCenterViewController(
+            leaderboardID: "grp.highest_balance",
+            playerScope: .global,
+            timeScope: .allTime
+        )
+        vc.gameCenterDelegate = context.coordinator
+        return vc
+    }
+    func updateUIViewController(_ uiViewController: GKGameCenterViewController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    class Coordinator: NSObject, GKGameCenterControllerDelegate {
+        func gameCenterViewControllerDidFinish(_ gameCenterViewController: GKGameCenterViewController) {
+            gameCenterViewController.dismiss(animated: true)
+        }
+    }
+}
+
+// MARK: - PREVIEW
 
 #Preview {
     ContentView()

@@ -23,7 +23,7 @@ enum OrientationController {
 }
 
 @main
-struct AtYarisiHDApp: App {
+struct AtYarisiHDv2App: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {

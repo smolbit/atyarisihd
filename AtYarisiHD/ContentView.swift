@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import GameKit
 import Combine
+import UserNotifications
 
 // MARK: - TEMA
 
@@ -71,43 +72,55 @@ enum AppState { case padock, racing, result, bankrupt, hardGameOver, cheatingCau
 // MARK: - HİLE SİSTEMİ
 
 enum CheatType: CaseIterable, Identifiable {
-    case sugarFeed       // Ata çaktırmadan şeker yedir
-    case illegalCoupon   // Seyise yasaklı iddia kuponu ver
-    case bribeJockey     // Jokeye rüşvet teklif et
+    case energyDrink   // L1 Hafif Hile — Enerji İçeceği
+    case laserGrip     // L2 Orta Hile  — Lazer Tutma
+    case shoeSabotage  // L3 Ağır Hile  — Nal Sökme
 
     var id: Self { self }
 
     var emoji: String {
         switch self {
-        case .sugarFeed:     return "🍬"
-        case .illegalCoupon: return "🎫"
-        case .bribeJockey:   return "💵"
+        case .energyDrink:  return "⚡"
+        case .laserGrip:    return "🔫"
+        case .shoeSabotage: return "🔧"
         }
     }
     var label: String {
         switch self {
-        case .sugarFeed:     return "Ata çaktırmadan şeker yedir"
-        case .illegalCoupon: return "Seyise yasaklı iddia kuponu ver"
-        case .bribeJockey:   return "Jokeye rüşvet teklif et"
+        case .energyDrink:  return "L1 · Enerji İçeceği"
+        case .laserGrip:    return "L2 · Lazer Tutma"
+        case .shoeSabotage: return "L3 · Nal Sökme"
         }
     }
-    var boostLabel: String {
+    var effectLabel: String {
         switch self {
-        case .sugarFeed:     return "+%20 şans"
-        case .illegalCoupon: return "+%10 şans"
-        case .bribeJockey:   return "+%25 şans"
+        case .energyDrink:  return "+%15 hız"
+        case .laserGrip:    return "şans taban +30"
+        case .shoeSabotage: return "2 rakip patlar"
         }
     }
-    /// Final score multiplier bonus (additive on top of 1.0)
-    var boost: Double {
+    /// Per-cheat catch probability
+    var catchRisk: Double {
         switch self {
-        case .sugarFeed:     return 0.20
-        case .illegalCoupon: return 0.10
-        case .bribeJockey:   return 0.25
+        case .energyDrink:  return 0.10
+        case .laserGrip:    return 0.25
+        case .shoeSabotage: return 0.15
         }
     }
-    /// 25% risk of getting caught for all cheat types
-    static let catchRisk: Double = 0.25
+    var riskLabel: String {
+        switch self {
+        case .energyDrink:  return "%10 risk"
+        case .laserGrip:    return "%25 risk"
+        case .shoeSabotage: return "%15 risk"
+        }
+    }
+    var penaltyLabel: String {
+        switch self {
+        case .energyDrink:  return "Bahis + %15 bakiye müsadere"
+        case .laserGrip:    return "Bahis + 500 ₺ ceza"
+        case .shoeSabotage: return "Anlık HARD GAME OVER"
+        }
+    }
 }
 
 enum TrackSurface: CaseIterable {
@@ -229,6 +242,11 @@ private let kMoneyWon      = "gy_totalMoneyWon"
 private let kMoneyLost     = "gy_totalMoneyLost"
 private let kBiggestWin    = "gy_biggestWin"
 private let kBiggestLoss   = "gy_biggestLoss"
+private let kInvest0       = "gy_invest_0"
+private let kInvest1       = "gy_invest_1"
+private let kInvest2       = "gy_invest_2"
+private let kInvest3       = "gy_invest_3"
+private let kLastClaim     = "gy_lastClaim"
 
 final class GameEngine: ObservableObject {
     // Feature 1: Published + Combine-persisted
@@ -265,6 +283,10 @@ final class GameEngine: ObservableObject {
     // Cheat system
     @Published var selectedCheat: CheatType? = nil
     @Published var caughtCheating: Bool = false
+
+    // Investment Office
+    @Published var investmentOwned: [Bool] = [false, false, false, false]
+    @Published var lastInvestmentClaim: Date = .distantPast
 
     private var timer: Timer?
     private let raceDuration: Double = 14.0
@@ -307,6 +329,21 @@ final class GameEngine: ObservableObject {
         $biggestWin.dropFirst().sink    { ud.set($0, forKey: kBiggestWin) }.store(in: &cancellables)
         $biggestLoss.dropFirst().sink   { ud.set($0, forKey: kBiggestLoss) }.store(in: &cancellables)
 
+        // Investment Office: load persisted state
+        investmentOwned = [
+            ud.bool(forKey: kInvest0),
+            ud.bool(forKey: kInvest1),
+            ud.bool(forKey: kInvest2),
+            ud.bool(forKey: kInvest3)
+        ]
+        if let d = ud.object(forKey: kLastClaim) as? Date { lastInvestmentClaim = d }
+
+        $investmentOwned.dropFirst().sink { arr in
+            ud.set(arr[0], forKey: kInvest0); ud.set(arr[1], forKey: kInvest1)
+            ud.set(arr[2], forKey: kInvest2); ud.set(arr[3], forKey: kInvest3)
+        }.store(in: &cancellables)
+        $lastInvestmentClaim.dropFirst().sink { ud.set($0, forKey: kLastClaim) }.store(in: &cancellables)
+
         // Feature 5: Game Center
         authenticateGameCenter()
     }
@@ -317,13 +354,16 @@ final class GameEngine: ObservableObject {
     func hardReset() {
         let ud = UserDefaults.standard
         [kBalance, kDebt, kTotalWins, kTotalLosses,
-         kMoneyWon, kMoneyLost, kBiggestWin, kBiggestLoss].forEach { ud.removeObject(forKey: $0) }
+         kMoneyWon, kMoneyLost, kBiggestWin, kBiggestLoss,
+         kInvest0, kInvest1, kInvest2, kInvest3, kLastClaim].forEach { ud.removeObject(forKey: $0) }
         balance = 100.0; debt = 0.0
         totalWins = 0; totalLosses = 0
         totalMoneyWon = 0; totalMoneyLost = 0
         biggestWin = 0; biggestLoss = 0
         raceCount = 0; betAmount = 5
         selectedCheat = nil; caughtCheating = false
+        investmentOwned = [false, false, false, false]
+        lastInvestmentClaim = .distantPast
         drawRaceField()
         commentator = "Padoka hoş geldin. Atını seç, bahsini koy."
         state = .padock
@@ -460,18 +500,37 @@ final class GameEngine: ObservableObject {
             }
         }
 
-        // Cheat: apply boost to selected horse's finalScore (pre-placement calc)
-        // Caught status is also decided here so it's locked in before race starts
+        // Cheat: per-cheat effect applied pre-race; caught status locked in now
         caughtCheating = false
         if let cheat = selectedCheat,
            let selId = selectedHorseId,
            let idx = arr.firstIndex(where: { $0.id == selId }) {
-            // Apply boost regardless — whether caught is revealed at finish
-            if arr[idx].finalScore > 0 {
-                arr[idx].finalScore *= (1.0 + cheat.boost)
+            switch cheat {
+            case .energyDrink:
+                // +15% to selected horse's final score
+                if arr[idx].finalScore > 0 { arr[idx].finalScore *= 1.15 }
+            case .laserGrip:
+                // RNG luck floor: ensure minimum score of baseAsset*0.5 + 30
+                if arr[idx].finalScore > 0 {
+                    let floor = arr[idx].baseAsset * 0.5 + 30.0
+                    arr[idx].finalScore = max(arr[idx].finalScore, floor)
+                }
+            case .shoeSabotage:
+                // Force top 2 non-selected opponents to boom
+                let opponents = arr.indices
+                    .filter { arr[$0].id != selId && !arr[$0].willBoom }
+                    .sorted { arr[$0].finalScore > arr[$1].finalScore }
+                for ti in opponents.prefix(2) {
+                    arr[ti].willBoom = true
+                    arr[ti].boomAtProgress = Double.random(in: 0.35...0.75)
+                    let k = [Horse.BoomKind.spin, .reverse, .faint].randomElement() ?? .spin
+                    arr[ti].boomKind = k
+                    arr[ti].boomReason = Self.boomReasonsByKind[k]?.randomElement() ?? "yarış dışı kaldı!"
+                    arr[ti].finalScore = -1 - Double.random(in: 0...0.5)
+                }
             }
-            // Roll the dice: 25% chance of getting caught
-            caughtCheating = Double.random(in: 0..<1) < CheatType.catchRisk
+            // Per-cheat catch risk
+            caughtCheating = Double.random(in: 0..<1) < cheat.catchRisk
         }
 
         let sorted = arr.sorted { $0.finalScore > $1.finalScore }
@@ -636,13 +695,41 @@ final class GameEngine: ObservableObject {
 
         raceFinished = true; raceCount += 1
 
-        // Cheat caught? → override everything, show ban screen
-        if selectedCheat != nil && caughtCheating {
-            commentator = "🚨 HİLE TESPİT EDİLDİ! Bahisçilikten men kararı çıkıyor..."
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
-                self?.state = .cheatingCaught
+        // Cheat caught? → per-cheat penalty (no uniform ban screen anymore)
+        if let cheat = selectedCheat, caughtCheating {
+            switch cheat {
+            case .energyDrink:
+                // Lose bet (already deducted) + 15% of remaining balance seized
+                let seized = (balance * 0.15).rounded(.up)
+                balance = max(0, balance - seized)
+                commentator = String(format: "🚨 DOPİNG TESPİT EDİLDİ! %.1f ₺ müsadere edildi!", seized)
+                selectedCheat = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
+                    guard let s = self else { return }
+                    s.state = s.balance < 5 ? .bankrupt : .result
+                }
+                return
+            case .laserGrip:
+                // Lose bet + Rıza slaps 500 ₺ fine
+                let fine = min(balance, 500.0)
+                balance = max(0, balance - fine)
+                commentator = String(format: "🚨 LAZER TESPİT EDİLDİ! Rıza %.1f ₺ kesti!", fine)
+                selectedCheat = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
+                    guard let s = self else { return }
+                    s.state = s.balance < 5 ? .bankrupt : .result
+                }
+                return
+            case .shoeSabotage:
+                // Immediate hard game over, debt slammed to 1000
+                debt = max(debt, 1000.0)
+                commentator = "🚨 NAL SÖKME TESPİT EDİLDİ! Tefeci Rıza devreye girdi!"
+                selectedCheat = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
+                    self?.state = .hardGameOver
+                }
+                return
             }
-            return
         }
 
         // Reset cheat selection for next round
@@ -685,6 +772,61 @@ final class GameEngine: ObservableObject {
         drawRaceField()
         commentator = "Tefeci Rıza parayı verdi. Şimdi koş bakalım..."
         state = .padock
+    }
+
+    // MARK: - Yatırım Ofisi
+
+    static let investmentCosts:  [Double] = [250, 1_000, 5_000, 25_000]
+    static let investmentIncome: [Double] = [25,  75,    250,   1_000]
+    static let investmentNames:  [String] = [
+        "Seyisler Derneği",
+        "Hipodrom Tostçusu",
+        "Ganyan Bayii İmtiyazı",
+        "Hipodrom Gizli Ortağı"
+    ]
+
+    var totalInvestmentIncome: Double {
+        investmentOwned.enumerated()
+            .compactMap { i, owned in owned ? Self.investmentIncome[i] : nil }
+            .reduce(0, +)
+    }
+    var hasAnyInvestment: Bool { investmentOwned.contains(true) }
+    var canClaimInvestment: Bool {
+        hasAnyInvestment && Date().timeIntervalSince(lastInvestmentClaim) >= 12 * 3600
+    }
+    var nextClaimDate: Date { lastInvestmentClaim.addingTimeInterval(12 * 3600) }
+
+    func buyInvestment(_ index: Int) {
+        guard index < 4, !investmentOwned[index] else { return }
+        let cost = Self.investmentCosts[index]
+        guard balance >= cost else { return }
+        balance -= cost
+        var arr = investmentOwned
+        arr[index] = true
+        investmentOwned = arr
+    }
+
+    func claimInvestment() {
+        guard canClaimInvestment else { return }
+        let income = totalInvestmentIncome
+        balance += income
+        lastInvestmentClaim = Date()
+        scheduleInvestmentNotification()
+    }
+
+    func scheduleInvestmentNotification() {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            center.removePendingNotificationRequests(withIdentifiers: ["invest_ready"])
+            let content = UNMutableNotificationContent()
+            content.title = "At Yarışı HD"
+            content.body = "Pasif gelirlerin hazır! Rıza Baba görmeden gel ve topla!"
+            content.sound = .default
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 12 * 3600, repeats: false)
+            let req = UNNotificationRequest(identifier: "invest_ready", content: content, trigger: trigger)
+            center.add(req) { _ in }
+        }
     }
 }
 
@@ -782,44 +924,42 @@ struct PadockView: View {
                     .foregroundColor(Theme.grassDark)
                 Spacer()
 
-                // Feature 2: Stats button — prominent, with horse emoji
+                // Feature 2: Stats button
                 Button(action: { showStats = true }) {
-                    HStack(spacing: 4) {
-                        Text("🐎")
-                            .font(.system(size: 12))
+                    HStack(spacing: 3) {
+                        Text("🐎").font(.system(size: 11))
                         Text("İSTATİSTİK")
                             .font(.system(size: 10, weight: .black, design: .monospaced))
+                            .fixedSize()
                     }
                     .foregroundColor(.white)
-                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
                     .background(Theme.grassDark)
                     .cornerRadius(5)
                 }
 
-                // Feature 5: Leaderboard button — bigger, gold, trophy
+                // Feature 5: Leaderboard button
                 Button(action: { showLeaderboard = true }) {
-                    HStack(spacing: 4) {
-                        Text("🏆")
-                            .font(.system(size: 12))
+                    HStack(spacing: 3) {
+                        Text("🏆").font(.system(size: 11))
                         Text("LİDER TABLOSU")
                             .font(.system(size: 10, weight: .black, design: .monospaced))
+                            .fixedSize()
                     }
                     .foregroundColor(Theme.inkBlack)
-                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
                     .background(Theme.accentGold.opacity(0.18))
                     .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.accentGold, lineWidth: 1.5))
                     .cornerRadius(5)
                 }
-
-                Text("100 AT · 8 KOŞAR")
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .foregroundColor(Theme.inkSoft)
             }
             .padding(.horizontal, 14).padding(.vertical, 6)
             .background(Theme.sand.opacity(0.5))
 
             ScrollView {
                 VStack(spacing: 6) {
+                    InvestmentOfficeView()
+                        .padding(.horizontal, 8).padding(.top, 8)
                     ForEach(engine.horses) { h in
                         HorseRow(horse: h, isSelected: h.id == engine.selectedHorseId) {
                             engine.selectHorse(h.id)
@@ -1214,30 +1354,31 @@ struct TrackArea: View {
             finishLine(at: trackEndWorld, cameraX: cameraX, h: h)
 
             // Feature 3: Şerit isim etiketleri — Dynamic Island clearance
-            // Background covers full panel width (diSafeInset + labelWidth)
-            // Text starts after the safe inset
             VStack(spacing: 0) {
                 ForEach(Array(engine.horses.enumerated()), id: \.element.id) { idx, horse in
+                    let isMyHorse = horse.id == engine.selectedHorseId
                     HStack(spacing: 4) {
                         Text("\(idx + 1)")
-                            .font(.system(size: 10, weight: .black, design: .monospaced))
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
                             .foregroundColor(.white)
-                            .frame(width: 16)
+                            .frame(width: 18)
                             .background(horse.tier.color)
                             .cornerRadius(3)
                         Text(horse.name)
-                            .font(.system(size: 10, weight: .heavy, design: .monospaced))
-                            .foregroundColor(Theme.inkBlack)
-                            .lineLimit(1).minimumScaleFactor(0.7)
+                            .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                            .foregroundColor(isMyHorse ? Theme.grassDark : Theme.inkBlack)
+                            .lineLimit(1).minimumScaleFactor(0.6)
                         Spacer()
                     }
-                    .padding(.leading, diSafeInset)   // clear DI/notch
+                    .padding(.leading, diSafeInset)
                     .padding(.trailing, 4)
                     .frame(height: laneH, alignment: .center)
-                    .background(Color.white.opacity(0.55))
+                    .background(isMyHorse
+                        ? Color(red: 0.75, green: 1.0, blue: 0.75).opacity(0.80)
+                        : Color.white.opacity(0.55))
                 }
             }
-            .frame(width: diSafeInset + 92, height: h)   // total width = inset + label area
+            .frame(width: diSafeInset + 106, height: h)
 
             // Atlar
             ForEach(Array(engine.horses.enumerated()), id: \.element.id) { idx, horse in
@@ -1477,7 +1618,7 @@ struct CheatPanelView: View {
                     .font(.system(size: 11, weight: .black, design: .monospaced))
                     .foregroundColor(Color(red: 0.55, green: 0.10, blue: 0.55))
                 Spacer()
-                Text("%25 YAKALANMA RİSKİ")
+                Text("HİLE YAP · YAKALAN · ÖDE")
                     .font(.system(size: 8, weight: .heavy, design: .monospaced))
                     .foregroundColor(Theme.accentRed)
                     .padding(.horizontal, 5).padding(.vertical, 2)
@@ -1500,8 +1641,9 @@ struct CheatPanelView: View {
                 CheatOptionRow(
                     emoji: cheat.emoji,
                     label: cheat.label,
-                    boostLabel: cheat.boostLabel,
+                    boostLabel: "\(cheat.effectLabel) · \(cheat.riskLabel)",
                     boostColor: Color(red: 0.55, green: 0.10, blue: 0.55),
+                    penaltyLabel: cheat.penaltyLabel,
                     isSelected: engine.selectedCheat == cheat
                 ) { engine.selectCheat(cheat) }
             }
@@ -1521,6 +1663,7 @@ struct CheatOptionRow: View {
     let label: String
     let boostLabel: String
     let boostColor: Color
+    var penaltyLabel: String = ""
     let isSelected: Bool
     let action: () -> Void
 
@@ -1531,13 +1674,21 @@ struct CheatOptionRow: View {
                     .font(.system(size: 14, weight: .heavy, design: .monospaced))
                     .foregroundColor(isSelected ? boostColor : Theme.inkSoft)
                 Text(emoji).font(.system(size: 14))
-                Text(label)
-                    .font(.system(size: 11, weight: isSelected ? .heavy : .regular, design: .monospaced))
-                    .foregroundColor(isSelected ? Theme.inkBlack : Theme.inkSoft)
-                    .lineLimit(1).minimumScaleFactor(0.8)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(label)
+                        .font(.system(size: 11, weight: isSelected ? .heavy : .regular, design: .monospaced))
+                        .foregroundColor(isSelected ? Theme.inkBlack : Theme.inkSoft)
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                    if isSelected && !penaltyLabel.isEmpty {
+                        Text("⚠ \(penaltyLabel)")
+                            .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                            .foregroundColor(Theme.accentRed)
+                            .lineLimit(1).minimumScaleFactor(0.7)
+                    }
+                }
                 Spacer()
                 Text(boostLabel)
-                    .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                    .font(.system(size: 9, weight: .heavy, design: .monospaced))
                     .foregroundColor(boostColor)
                     .padding(.horizontal, 5).padding(.vertical, 2)
                     .background(boostColor.opacity(0.10))
@@ -1775,6 +1926,137 @@ struct GameCenterView: UIViewControllerRepresentable {
         func gameCenterViewControllerDidFinish(_ gameCenterViewController: GKGameCenterViewController) {
             gameCenterViewController.dismiss(animated: true)
         }
+    }
+}
+
+// MARK: - YATIRIM OFİSİ
+
+struct InvestmentOfficeView: View {
+    @EnvironmentObject var engine: GameEngine
+    @State private var expanded: Bool = false
+    @State private var now: Date = Date()
+    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header / toggle
+            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() } }) {
+                HStack(spacing: 6) {
+                    Text("💼").font(.system(size: 14))
+                    Text("YATIRIM OFİSİ")
+                        .font(.system(size: 11, weight: .black, design: .monospaced))
+                        .foregroundColor(Color(red: 0.10, green: 0.25, blue: 0.55))
+                    Spacer()
+                    if engine.hasAnyInvestment {
+                        Text(String(format: "+%.0f ₺/12s", engine.totalInvestmentIncome))
+                            .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                            .foregroundColor(Theme.goodGreen)
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(Theme.goodGreen.opacity(0.12)).cornerRadius(3)
+                    }
+                    Text(expanded ? "▲" : "▼")
+                        .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                        .foregroundColor(Color(red: 0.10, green: 0.25, blue: 0.55))
+                }
+                .padding(.horizontal, 12).padding(.vertical, 9)
+            }
+            .buttonStyle(.plain)
+            .background(Color(red: 0.90, green: 0.94, blue: 1.0))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(red: 0.60, green: 0.75, blue: 1.0), lineWidth: 1))
+
+            if expanded {
+                VStack(spacing: 0) {
+                    // Claim row
+                    if engine.hasAnyInvestment {
+                        HStack(spacing: 8) {
+                            if engine.canClaimInvestment {
+                                Button(action: { engine.claimInvestment() }) {
+                                    Text(String(format: "💰 GELİRLERİ TOPLA  +%.0f ₺", engine.totalInvestmentIncome))
+                                        .font(.system(size: 12, weight: .black, design: .monospaced))
+                                        .foregroundColor(.white)
+                                        .frame(maxWidth: .infinity).padding(.vertical, 9)
+                                        .background(Theme.goodGreen).cornerRadius(6)
+                                }
+                                .buttonStyle(.plain)
+                            } else {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("⏱ Sıradaki gelir:")
+                                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                        .foregroundColor(Theme.inkSoft)
+                                    Text(countdownString)
+                                        .font(.system(size: 14, weight: .heavy, design: .monospaced))
+                                        .foregroundColor(Color(red: 0.10, green: 0.25, blue: 0.55))
+                                }
+                                Spacer()
+                                Text(String(format: "+%.0f ₺", engine.totalInvestmentIncome))
+                                    .font(.system(size: 18, weight: .heavy, design: .monospaced))
+                                    .foregroundColor(Theme.accentGold)
+                            }
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(Color(red: 0.94, green: 0.97, blue: 1.0))
+                        Divider()
+                    }
+
+                    // Investment tiers
+                    ForEach(0..<4, id: \.self) { i in
+                        investmentRow(i)
+                        if i < 3 { Divider().padding(.leading, 12) }
+                    }
+                }
+                .background(Color(red: 0.97, green: 0.98, blue: 1.0))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(red: 0.60, green: 0.75, blue: 1.0), lineWidth: 1))
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .onReceive(ticker) { t in now = t }
+    }
+
+    @ViewBuilder
+    private func investmentRow(_ i: Int) -> some View {
+        let owned   = engine.investmentOwned[i]
+        let cost    = GameEngine.investmentCosts[i]
+        let income  = GameEngine.investmentIncome[i]
+        let name    = GameEngine.investmentNames[i]
+        let canBuy  = !owned && engine.balance >= cost
+
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name)
+                    .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                    .foregroundColor(owned ? Color(red: 0.10, green: 0.25, blue: 0.55) : Theme.inkBlack)
+                Text(owned
+                     ? String(format: "+%.0f ₺ / 12 saat ✓", income)
+                     : String(format: "Maliyet: %.0f ₺  →  +%.0f ₺/12s", cost, income))
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundColor(owned ? Theme.goodGreen : Theme.inkSoft)
+            }
+            Spacer()
+            if owned {
+                Text("✅")
+                    .font(.system(size: 18))
+            } else {
+                Button(action: { engine.buyInvestment(i) }) {
+                    Text(canBuy ? "SATIN AL" : "YETERSİZ")
+                        .font(.system(size: 9, weight: .black, design: .monospaced))
+                        .foregroundColor(canBuy ? .white : Theme.inkSoft)
+                        .padding(.horizontal, 8).padding(.vertical, 5)
+                        .background(canBuy ? Color(red: 0.10, green: 0.25, blue: 0.55) : Theme.line)
+                        .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+                .disabled(!canBuy)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+    }
+
+    private var countdownString: String {
+        let remaining = max(0, engine.nextClaimDate.timeIntervalSince(now))
+        let h = Int(remaining) / 3600
+        let m = (Int(remaining) % 3600) / 60
+        let s = Int(remaining) % 60
+        return String(format: "%02d:%02d:%02d", h, m, s)
     }
 }
 

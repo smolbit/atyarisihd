@@ -62,5 +62,7 @@
 	<false/>
 	<key>NSGameCenterUsageDescription</key>
 	<string>Liderlik tablosunda en yüksek bakiyeni kaydet!</string>
+	<key>NSUserNotificationsUsageDescription</key>
+	<string>Yatırım gelirlerin hazır olduğunda seni bilgilendireceğiz.</string>
 </dict>
 </plist>

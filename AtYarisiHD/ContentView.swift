@@ -253,6 +253,31 @@ struct CloudSprite: Identifiable {
     var emoji: String
 }
 
+// MARK: - HAKTİK MOTORU
+
+enum HapticEngine {
+    static func light() {
+        let g = UIImpactFeedbackGenerator(style: .light)
+        g.prepare(); g.impactOccurred()
+    }
+    static func rigid() {
+        let g = UIImpactFeedbackGenerator(style: .rigid)
+        g.prepare(); g.impactOccurred()
+    }
+    static func heavy() {
+        let g = UIImpactFeedbackGenerator(style: .heavy)
+        g.prepare(); g.impactOccurred()
+    }
+    static func success() {
+        let g = UINotificationFeedbackGenerator()
+        g.prepare(); g.notificationOccurred(.success)
+    }
+    static func error() {
+        let g = UINotificationFeedbackGenerator()
+        g.prepare(); g.notificationOccurred(.error)
+    }
+}
+
 // MARK: - USERDEFAULTS KEYS
 
 private let kBalance       = "gy_balance"
@@ -514,6 +539,7 @@ final class GameEngine: ObservableObject {
         } else {
             guard horseBets.count < 2 else {
                 betLimitReached = true
+                HapticEngine.rigid()   // limit darbe: 3. at yasak
                 return
             }
             horseBets[id] = 5.0
@@ -679,6 +705,7 @@ final class GameEngine: ObservableObject {
                         arr[i].progress = arr[i].boomAtProgress
                         booming = "💥 BOOM! \(arr[i].name) \(arr[i].boomReason)"
                         lastCommentaryTime = raceTime
+                        if raceBets[arr[i].id] != nil { HapticEngine.error() }  // oyuncunun ati patladı
                         continue
                     }
                 }
@@ -760,6 +787,7 @@ final class GameEngine: ObservableObject {
         }
 
         if wonAny {
+            HapticEngine.success()     // kazanç bildirimi
             didWin = true
             lastWinPlacement = bestPlacement
             let netProfit = totalGross - lastBet
@@ -814,6 +842,7 @@ final class GameEngine: ObservableObject {
                 debt = max(debt, 1000.0)
                 commentator = "🚨 NAL SÖKME TESPİT! Tefeci Rıza devreye girdi!"
                 selectedCheat = nil
+                HapticEngine.error()   // ağır hile, oyun bitti
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
                     self?.state = .hardGameOver
                 }
@@ -823,6 +852,7 @@ final class GameEngine: ObservableObject {
 
         selectedCheat = nil
         let nextState: AppState = debt >= 1000.0 ? .hardGameOver : .result
+        if nextState == .hardGameOver { HapticEngine.error() }  // borç 1000+ → hard game over
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
             self?.state = nextState
         }
@@ -845,6 +875,7 @@ final class GameEngine: ObservableObject {
     func takeLoanShark() {
         balance += 250; debt += 375
         if debt >= 1000.0 {
+            HapticEngine.error()   // tefeci pisti devraldı
             commentator = "Tefeci Rıza pisti devraldı. Borç 1000 ₺'yi geçti!"
             drawRaceField(); state = .hardGameOver; return
         }
@@ -888,6 +919,7 @@ final class GameEngine: ObservableObject {
         guard canClaimInvestment else { return }
         balance += totalInvestmentIncome
         lastInvestmentClaim = Date()
+        HapticEngine.success()   // yatırım geliri toplandı
         scheduleInvestmentNotification()
     }
 
@@ -997,7 +1029,7 @@ struct PadockView: View {
                 Spacer()
 
                 // Stats button — fixedSize prevents truncation
-                Button(action: { showStats = true }) {
+                Button(action: { HapticEngine.light(); showStats = true }) {
                     HStack(spacing: 3) {
                         Text("🐎").font(.system(size: 11))
                         Text("İSTATİSTİK")
@@ -1011,7 +1043,7 @@ struct PadockView: View {
                 }
 
                 // Leaderboard button
-                Button(action: { showLeaderboard = true }) {
+                Button(action: { HapticEngine.light(); showLeaderboard = true }) {
                     HStack(spacing: 3) {
                         Text("🏆").font(.system(size: 11))
                         Text("LİDER TABLOSU")
@@ -1039,12 +1071,14 @@ struct PadockView: View {
                             isFocused: h.id == engine.activeHorseId,
                             isExpanded: h.id == expandedHorseId,
                             onTap: {
+                                HapticEngine.light()   // at satırı tap: seç/genişlet
                                 withAnimation(.easeInOut(duration: 0.22)) {
                                     expandedHorseId = (expandedHorseId == h.id) ? nil : h.id
                                 }
                                 engine.selectHorse(h.id)
                             },
                             onDeselect: {
+                                HapticEngine.rigid()   // ✕ İPTAL butonu: ağır darbe
                                 withAnimation(.easeInOut(duration: 0.22)) {
                                     if expandedHorseId == h.id { expandedHorseId = nil }
                                 }
@@ -2131,7 +2165,7 @@ struct InvestmentOfficeView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Header toggle
-            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() } }) {
+            Button(action: { HapticEngine.light(); withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() } }) {
                 HStack(spacing: 6) {
                     Text("💼").font(.system(size: 15))
                     Text("YATIRIM OFİSİ")

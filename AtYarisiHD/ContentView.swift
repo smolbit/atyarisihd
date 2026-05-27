@@ -286,8 +286,16 @@ final class GameEngine: ObservableObject {
 
     @Published var state: AppState = .padock
     @Published var horses: [Horse] = []
-    @Published var selectedHorseId: UUID? = nil
-    @Published var betAmount: Double = 5.0
+    @Published var horseBets: [UUID: Double] = [:]
+    @Published var activeHorseId: UUID? = nil
+    @Published var raceBets: [UUID: Double] = [:]
+
+    var activeBet: Double {
+        guard let id = activeHorseId, let b = horseBets[id] else { return 5.0 }
+        return b
+    }
+    var totalBet: Double { horseBets.values.reduce(0, +) }
+    @Published var betLimitReached = false
     @Published var commentator: String = "Padoka hoş geldin. Atını seç, bahsini koy."
 
     @Published var raceTime: Double = 0
@@ -388,7 +396,8 @@ final class GameEngine: ObservableObject {
         totalWins = 0; totalLosses = 0
         totalMoneyWon = 0; totalMoneyLost = 0
         biggestWin = 0; biggestLoss = 0
-        raceCount = 0; betAmount = 5
+        raceCount = 0
+        horseBets = [:]; activeHorseId = nil; raceBets = [:]
         selectedCheat = nil; caughtCheating = false
         investmentOwned = [false, false, false, false, false]
         lastInvestmentClaim = .distantPast
@@ -466,7 +475,7 @@ final class GameEngine: ObservableObject {
         arr.shuffle()
         for i in arr.indices { arr[i].lane = i }
         horses = arr
-        selectedHorseId = nil
+        horseBets = [:]; activeHorseId = nil
     }
 
     private func makeStats(for tier: HorseTier) -> (Int, Int, Int, Int) {
@@ -499,29 +508,57 @@ final class GameEngine: ObservableObject {
         return (Double.random(in: r) * 10).rounded() / 10
     }
 
-    func selectHorse(_ id: UUID) { selectedHorseId = id; selectedCheat = nil }
-    func selectCheat(_ cheat: CheatType?) { selectedCheat = cheat }
-    func setBet(_ a: Double) {
-        var b = a
-        if b > balance { b = balance }
-        if b < 5 { b = 5 }
-        if b > balance { b = balance }
-        betAmount = b
+    func selectHorse(_ id: UUID) {
+        if horseBets[id] != nil {
+            deselectHorse(id)
+        } else {
+            guard horseBets.count < 2 else {
+                betLimitReached = true
+                return
+            }
+            horseBets[id] = 5.0
+            activeHorseId = id
+        }
+        selectedCheat = nil
     }
-    func adjustBet(_ d: Double) { setBet(betAmount + d) }
-    func allIn() { if balance >= 5 { betAmount = balance } }
+    func deselectHorse(_ id: UUID) {
+        horseBets.removeValue(forKey: id)
+        if activeHorseId == id { activeHorseId = horseBets.keys.first }
+    }
+    func focusHorse(_ id: UUID) {
+        guard horseBets[id] != nil else { return }
+        activeHorseId = id
+    }
+    func selectCheat(_ cheat: CheatType?) { selectedCheat = cheat }
+    func setActiveBet(_ amount: Double) {
+        guard let id = activeHorseId else { return }
+        let otherBets = horseBets.filter { $0.key != id }.values.reduce(0, +)
+        let maxBet = max(5, balance - otherBets)
+        let clamped = min(max(5, amount), maxBet)
+        horseBets[id] = clamped
+    }
+    func adjustActiveBet(_ delta: Double) { setActiveBet(activeBet + delta) }
+    func allIn() {
+        guard let id = activeHorseId else { return }
+        let otherBets = horseBets.filter { $0.key != id }.values.reduce(0, +)
+        let remaining = balance - otherBets
+        if remaining >= 5 { horseBets[id] = remaining }
+    }
     var canPlaceBet: Bool {
-        selectedHorseId != nil && betAmount >= 5 && betAmount <= balance && balance >= 5
+        !horseBets.isEmpty && totalBet >= 5 && totalBet <= balance && balance >= 5
     }
 
     func placeBetAndStart() {
         guard canPlaceBet else { return }
-        balance -= betAmount
-        lastBet = betAmount
+        raceBets = horseBets
+        lastBet = totalBet
+        balance -= totalBet
         trackSurface = TrackSurface.allCases.randomElement() ?? .grass
         generateClouds()
         cameraProgress = 0
         preCalculateRace()
+        horseBets = [:]
+        activeHorseId = nil
         raceTime = 0
         raceFinished = false
         commentator = "🏁 GONG! Atlar çıktı!"
@@ -562,7 +599,7 @@ final class GameEngine: ObservableObject {
         // Cheat: per-cheat effect; caught status locked in now
         caughtCheating = false
         if let cheat = selectedCheat,
-           let selId = selectedHorseId,
+           let selId = activeHorseId,
            let idx = arr.firstIndex(where: { $0.id == selId }) {
             switch cheat {
             case .energyDrink:
@@ -709,33 +746,36 @@ final class GameEngine: ObservableObject {
         let winner = horses.first(where: { $0.placement == 1 })
         if let w = winner { commentator = "🏆 KAZANAN: \(w.name)! Ödemeler yapılıyor..." }
 
-        // Tiered payout: 1st=100%, 2nd=40%, 3rd=20%
-        if let selId = selectedHorseId,
-           let my = horses.first(where: { $0.id == selId }),
-           !my.willBoom, my.placement >= 1, my.placement <= 3 {
+        // Multi-horse tiered payout: 1st=100%, 2nd=40%, 3rd=20%
+        var totalGross = 0.0
+        var wonAny = false
+        var bestPlacement = 999
+        for (horseId, bet) in raceBets {
+            guard let horse = horses.first(where: { $0.id == horseId }),
+                  !horse.willBoom, horse.placement >= 1, horse.placement <= 3 else { continue }
+            wonAny = true
+            if horse.placement < bestPlacement { bestPlacement = horse.placement }
+            let factor: Double = horse.placement == 1 ? 1.0 : (horse.placement == 2 ? 0.4 : 0.2)
+            totalGross += bet * horse.odds * factor
+        }
 
+        if wonAny {
             didWin = true
-            lastWinPlacement = my.placement
-
-            let fullGross = lastBet * my.odds
-            let factor: Double = my.placement == 1 ? 1.0 : (my.placement == 2 ? 0.4 : 0.2)
-            let gross = fullGross * factor
-            let netProfit = gross - lastBet
-
+            lastWinPlacement = bestPlacement
+            let netProfit = totalGross - lastBet
             var dp: Double = 0
             if debt > 0 && netProfit > 0 {
                 dp = min(debt, netProfit * 0.5)
                 debt -= dp
                 if debt < 0.01 { debt = 0 }
             }
-            let recv = gross - dp
-            lastGross = gross; lastDebtPayment = dp; lastNetReceived = recv
+            let recv = totalGross - dp
+            lastGross = totalGross; lastDebtPayment = dp; lastNetReceived = recv
             balance += recv
             recordStats(won: true, netAmount: recv - lastBet)
-
-            if my.placement == 2 {
+            if bestPlacement == 2 {
                 commentator = String(format: "🥈 2. BİTİŞ! Teselli ikramiyesi +%.1f ₺", recv)
-            } else if my.placement == 3 {
+            } else if bestPlacement == 3 {
                 commentator = String(format: "🥉 3. BİTİŞ! Teselli ikramiyesi +%.1f ₺", recv)
             }
         } else {
@@ -792,22 +832,18 @@ final class GameEngine: ObservableObject {
         selectedCheat = nil; caughtCheating = false; lastWinPlacement = 0
         drawRaceField()
         if balance < 5 { state = .bankrupt; return }
-        if betAmount > balance { betAmount = balance }
-        if betAmount < 5 { betAmount = 5 }
         commentator = "Padoka hoş geldin. Atını seç, bahsini koy."
         state = .padock
     }
 
     func shovelManure() {
-        balance += 5; drawRaceField(); betAmount = 5
+        balance += 5; drawRaceField()
         commentator = "Sırtın ağrıdı, 5 ₺ kazandın. Şansını dene!"
         state = .padock
     }
 
     func takeLoanShark() {
         balance += 250; debt += 375
-        if betAmount < 5 { betAmount = 5 }
-        if betAmount > balance { betAmount = balance }
         if debt >= 1000.0 {
             commentator = "Tefeci Rıza pisti devraldı. Borç 1000 ₺'yi geçti!"
             drawRaceField(); state = .hardGameOver; return
@@ -948,6 +984,7 @@ struct PadockView: View {
     @EnvironmentObject var engine: GameEngine
     @State private var showStats = false
     @State private var showLeaderboard = false
+    @State private var expandedHorseId: UUID? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -996,21 +1033,44 @@ struct PadockView: View {
                     InvestmentOfficeView()
                         .padding(.horizontal, 8).padding(.top, 8)
                     ForEach(engine.horses) { h in
-                        HorseRow(horse: h, isSelected: h.id == engine.selectedHorseId) {
-                            engine.selectHorse(h.id)
-                        }
+                        HorseRow(
+                            horse: h,
+                            horseBet: engine.horseBets[h.id],
+                            isFocused: h.id == engine.activeHorseId,
+                            isExpanded: h.id == expandedHorseId,
+                            onTap: {
+                                withAnimation(.easeInOut(duration: 0.22)) {
+                                    expandedHorseId = (expandedHorseId == h.id) ? nil : h.id
+                                }
+                                engine.selectHorse(h.id)
+                            },
+                            onDeselect: {
+                                withAnimation(.easeInOut(duration: 0.22)) {
+                                    if expandedHorseId == h.id { expandedHorseId = nil }
+                                }
+                                engine.deselectHorse(h.id)
+                            }
+                        )
                     }
                 }
                 .padding(.horizontal, 8).padding(.bottom, 8)
             }
 
-            if engine.selectedHorseId != nil {
+            if !engine.horseBets.isEmpty {
                 CheatPanelView()
             }
             BetPanelView()
         }
         .sheet(isPresented: $showStats) { StatsView().environmentObject(engine) }
         .sheet(isPresented: $showLeaderboard) { GameCenterView() }
+        .alert("Maksimum 2 At", isPresented: $engine.betLimitReached) {
+            Button("Tamam", role: .cancel) { }
+        } message: {
+            Text("Aynı yarışa en fazla 2 ata bahis yapabilirsiniz.")
+        }
+        .onChange(of: engine.horses) { _ in
+            withAnimation(.easeInOut(duration: 0.18)) { expandedHorseId = nil }
+        }
     }
 }
 
@@ -1018,13 +1078,34 @@ struct PadockView: View {
 
 struct HorseRow: View {
     let horse: Horse
-    let isSelected: Bool
+    let horseBet: Double?
+    let isFocused: Bool
+    let isExpanded: Bool
     let onTap: () -> Void
+    let onDeselect: () -> Void
 
     private var isJackpot: Bool { horse.tier == .jackpot }
+    private var isSelected: Bool { horseBet != nil }
+
+    private var bgColor: Color {
+        if isJackpot { return Theme.accentGold.opacity(0.09) }
+        if isFocused  { return Theme.grass.opacity(0.15) }
+        if isSelected { return Theme.grass.opacity(0.07) }
+        return Theme.card
+    }
+    private var borderColor: Color {
+        if isJackpot  { return Theme.accentGold }
+        if isFocused  { return Theme.grassDark }
+        if isSelected { return Theme.grass }
+        return Theme.line
+    }
+    private var borderWidth: CGFloat {
+        isJackpot ? 2.5 : (isFocused ? 2.5 : (isSelected ? 1.5 : 1))
+    }
 
     var body: some View {
-        Button(action: onTap) {
+        VStack(spacing: 0) {
+            // ── Collapsed header ──
             ZStack(alignment: .topTrailing) {
                 HStack(spacing: 10) {
                     ZStack {
@@ -1048,30 +1129,41 @@ struct HorseRow: View {
                         }
                     }
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 4) {
-                        Text(String(format: "%.1fx", horse.odds))
-                            .font(.system(size: 18, weight: .heavy, design: .monospaced))
-                            .foregroundColor(isJackpot ? Theme.accentGold : Theme.accentGold)
-                        HStack(spacing: 4) {
-                            StatBadge(label: "H", value: horse.speed)
-                            StatBadge(label: "C", value: horse.health)
-                            StatBadge(label: "D", value: horse.stability)
-                            StatBadge(label: "G", value: horse.reliability)
+                    HStack(spacing: 6) {
+                        if let bet = horseBet {
+                            Button(action: onDeselect) {
+                                HStack(spacing: 3) {
+                                    Text("✕")
+                                        .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                                    Text("İPTAL")
+                                        .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                                }
+                                .foregroundColor(.white)
+                                .frame(minWidth: 52)
+                                .padding(.horizontal, 10).padding(.vertical, 4)
+                                .background(Theme.accentRed)
+                                .cornerRadius(4)
+                            }
+                            .buttonStyle(.plain)
+                            Text(String(format: "%.0f₺", bet))
+                                .font(.system(size: 12, weight: .black, design: .monospaced))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .background(isFocused ? Theme.grassDark : Theme.grass)
+                                .cornerRadius(4)
+                        }
+                        VStack(alignment: .trailing, spacing: 0) {
+                            Text(String(format: "%.1fx", horse.odds))
+                                .font(.system(size: 18, weight: .heavy, design: .monospaced))
+                                .foregroundColor(Theme.accentGold)
+                            Text(isExpanded ? "▲" : "▼")
+                                .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                                .foregroundColor(Theme.inkSoft.opacity(0.5))
                         }
                     }
                 }
                 .padding(.horizontal, 10).padding(.vertical, 9)
-                .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(isJackpot
-                        ? Theme.accentGold.opacity(0.09)
-                        : (isSelected ? Theme.grass.opacity(0.10) : Theme.card)))
-                .overlay(RoundedRectangle(cornerRadius: 8)
-                    .stroke(isJackpot
-                        ? Theme.accentGold
-                        : (isSelected ? Theme.grassDark : Theme.line),
-                            lineWidth: isJackpot ? 2.5 : (isSelected ? 2 : 1)))
 
-                // Jackpot badge
                 if isJackpot {
                     Text("✦ JACKPOT")
                         .font(.system(size: 8, weight: .black, design: .monospaced))
@@ -1080,10 +1172,56 @@ struct HorseRow: View {
                         .background(Theme.accentGold)
                         .cornerRadius(4)
                         .padding(.top, 6).padding(.trailing, 10)
+                        .allowsHitTesting(false)
                 }
             }
+
+            // ── Expanded stats ──
+            if isExpanded {
+                VStack(spacing: 8) {
+                    Rectangle()
+                        .fill(borderColor.opacity(0.35))
+                        .frame(height: 0.75)
+                        .padding(.horizontal, 10)
+                    HStack(spacing: 0) {
+                        statCell("H", "Hız",       horse.speed)
+                        statCell("S", "Sağlık",    horse.health)
+                        statCell("D", "Dayanım",   horse.stability)
+                        statCell("G", "Güvenilir", horse.reliability)
+                    }
+                    .padding(.bottom, 10)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
-        .buttonStyle(.plain)
+        .background(RoundedRectangle(cornerRadius: 8).fill(bgColor))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(borderColor, lineWidth: borderWidth))
+        .contentShape(Rectangle())
+        .onTapGesture { onTap() }
+    }
+
+    @ViewBuilder
+    private func statCell(_ letter: String, _ label: String, _ value: Int) -> some View {
+        let col = statColor(value)
+        VStack(spacing: 1) {
+            Text(letter)
+                .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                .foregroundColor(col)
+            Text("\(value)")
+                .font(.system(size: 18, weight: .black, design: .monospaced))
+                .foregroundColor(col)
+            Text(label)
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundColor(Theme.inkSoft)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func statColor(_ v: Int) -> Color {
+        if v >= 80 { return Theme.goodGreen }
+        if v >= 50 { return Theme.accentGold }
+        if v >= 25 { return Color(red: 0.85, green: 0.45, blue: 0.10) }
+        return Theme.accentRed
     }
 }
 
@@ -1106,34 +1244,69 @@ struct StatBadge: View {
 
 struct BetPanelView: View {
     @EnvironmentObject var engine: GameEngine
+    @State private var showBetInput = false
+    @State private var betInputText = ""
+
     var body: some View {
         VStack(spacing: 8) {
+            // Active horse + bet amount row
             HStack {
-                Text("BAHİS")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(Theme.inkSoft)
+                if let id = engine.activeHorseId,
+                   let horse = engine.horses.first(where: { $0.id == id }) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("AKTİF AT")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundColor(Theme.inkSoft)
+                        Text(horse.name)
+                            .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                            .foregroundColor(horse.tier.color)
+                            .lineLimit(1)
+                    }
+                } else {
+                    Text("BAHİS")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(Theme.inkSoft)
+                }
                 Spacer()
-                Text(String(format: "%.1f ₺", engine.betAmount))
-                    .font(.system(size: 24, weight: .heavy, design: .monospaced))
-                    .foregroundColor(Theme.accentGold)
+                VStack(alignment: .trailing, spacing: 0) {
+                    Button(action: {
+                        betInputText = String(Int(engine.activeBet))
+                        showBetInput = true
+                    }) {
+                        Text(String(format: "%.1f ₺", engine.activeBet))
+                            .font(.system(size: 24, weight: .heavy, design: .monospaced))
+                            .foregroundColor(Theme.accentGold)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(engine.activeHorseId == nil)
+                    if engine.horseBets.count > 1 {
+                        Text(String(format: "TOPLAM: %.1f ₺", engine.totalBet))
+                            .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                            .foregroundColor(Theme.accentGold.opacity(0.65))
+                    }
+                }
             }
+            // Dynamic bet buttons
             HStack(spacing: 5) {
-                BetButton("-50") { engine.adjustBet(-50) }
-                BetButton("-10") { engine.adjustBet(-10) }
-                BetButton("-5")  { engine.adjustBet(-5) }
-                BetButton("+5")  { engine.adjustBet(5) }
-                BetButton("+10") { engine.adjustBet(10) }
-                BetButton("+50") { engine.adjustBet(50) }
+                ForEach(betButtonAmounts, id: \.self) { d in
+                    BetButton(d >= 0 ? "+\(Int(d))" : "\(Int(d))") {
+                        engine.adjustActiveBet(d)
+                    }
+                    .opacity(engine.activeHorseId == nil ? 0.4 : 1.0)
+                    .disabled(engine.activeHorseId == nil)
+                }
                 Button(action: { engine.allIn() }) {
                     Text("KASAYI BAS")
                         .font(.system(size: 10, weight: .black, design: .monospaced))
                         .foregroundColor(.white)
                         .padding(.horizontal, 8).padding(.vertical, 8)
-                        .background(Theme.accentRed).cornerRadius(4)
+                        .background(engine.activeHorseId == nil ? Theme.line : Theme.accentRed)
+                        .cornerRadius(4)
                 }
+                .disabled(engine.activeHorseId == nil)
             }
             Button(action: { engine.placeBetAndStart() }) {
-                Text(label)
+                Text(startLabel)
                     .font(.system(size: 16, weight: .heavy, design: .monospaced))
                     .frame(maxWidth: .infinity).padding(.vertical, 13)
                     .background(engine.canPlaceBet ? Theme.grassDark : Theme.line)
@@ -1145,11 +1318,33 @@ struct BetPanelView: View {
         .padding(.horizontal, 12).padding(.vertical, 10)
         .background(Theme.card)
         .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.line), alignment: .top)
+        .alert("Bahis Miktarı Gir", isPresented: $showBetInput) {
+            TextField("örn. 100", text: $betInputText)
+                .keyboardType(.numberPad)
+            Button("Tamam") {
+                if let v = Double(betInputText.filter("0123456789".contains)), v > 0 {
+                    engine.setActiveBet(v)
+                }
+                betInputText = ""
+            }
+            Button("İptal", role: .cancel) { betInputText = "" }
+        } message: {
+            Text(String(format: "Min 5 ₺ · Max %.0f ₺", engine.balance))
+        }
     }
-    private var label: String {
+
+    private var betButtonAmounts: [Double] {
+        let b = engine.balance
+        if b >= 2000 { return [-500, -200, -100, 100, 200, 500] }
+        if b >= 1000 { return [-200, -100, -50,   50, 100, 200] }
+        if b >= 500  { return [-100,  -50, -10,   10,  50, 100] }
+        return [-50, -10, -5, 5, 10, 50]
+    }
+
+    private var startLabel: String {
         if engine.balance < 5 { return "BAKİYE YETERSİZ" }
-        if engine.selectedHorseId == nil { return "ÖNCE AT SEÇ!" }
-        return "▶ YARIŞA BAŞLA!"
+        if engine.horseBets.isEmpty { return "ÖNCE AT SEÇ!" }
+        return String(format: "▶ YARIŞA BAŞLA!  (%.1f ₺)", engine.totalBet)
     }
 }
 
@@ -1228,28 +1423,28 @@ struct SpikerOverlay: View {
 struct BetInfoChip: View {
     @EnvironmentObject var engine: GameEngine
     var body: some View {
-        if let id = engine.selectedHorseId,
-           let h = engine.horses.first(where: { $0.id == id }) {
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(h.name)
-                    .font(.system(size: 10, weight: .heavy, design: .monospaced))
-                    .foregroundColor(h.tier.color).lineLimit(1)
-                Text(String(format: "%.1f ₺ × %.1fx", engine.lastBet, h.odds))
-                    .font(.system(size: 10, weight: .heavy, design: .monospaced))
-                    .foregroundColor(Theme.accentGold)
-                Text(String(format: "BAKİYE %.1f ₺", engine.balance))
+        let myHorses = engine.horses.filter { engine.raceBets[$0.id] != nil }
+        if !myHorses.isEmpty {
+            VStack(alignment: .trailing, spacing: 2) {
+                ForEach(myHorses) { h in
+                    if let bet = engine.raceBets[h.id] {
+                        HStack(spacing: 4) {
+                            Text(h.name)
+                                .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                                .foregroundColor(h.tier.color).lineLimit(1)
+                            Text(String(format: "%.0f₺×%.1fx", bet, h.odds))
+                                .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                                .foregroundColor(Theme.accentGold)
+                        }
+                    }
+                }
+                Text(String(format: "TOPLAM %.1f ₺ · BAK %.1f ₺", engine.lastBet, engine.balance))
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
                     .foregroundColor(Theme.inkSoft)
-                if h.tier == .jackpot {
-                    Text("⭐ 3x JACKPOT")
-                        .font(.system(size: 8, weight: .black, design: .monospaced))
-                        .foregroundColor(Theme.accentGold)
-                }
             }
             .padding(.horizontal, 8).padding(.vertical, 5)
             .background(Color.white.opacity(0.88))
-            .overlay(RoundedRectangle(cornerRadius: 6).stroke(
-                h.tier == .jackpot ? Theme.accentGold : Theme.line, lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.line, lineWidth: 1))
             .cornerRadius(6)
         }
     }
@@ -1380,7 +1575,7 @@ struct TrackArea: View {
             // Lane labels — DI-safe, bigger font, green=player, gold=jackpot
             VStack(spacing: 0) {
                 ForEach(Array(engine.horses.enumerated()), id: \.element.id) { idx, horse in
-                    let isMyHorse = horse.id == engine.selectedHorseId
+                    let isMyHorse = engine.raceBets[horse.id] != nil
                     let isJackpot = horse.tier == .jackpot
                     HStack(spacing: 4) {
                         Text("\(idx + 1)")
@@ -1465,8 +1660,8 @@ struct ResultView: View {
     @EnvironmentObject var engine: GameEngine
 
     var body: some View {
-        let winner  = engine.horses.first(where: { $0.placement == 1 })
-        let myHorse = engine.horses.first(where: { $0.id == engine.selectedHorseId })
+        let winner   = engine.horses.first(where: { $0.placement == 1 })
+        let myHorses = engine.horses.filter { engine.raceBets[$0.id] != nil }
 
         VStack(spacing: 14) {
             HeaderView()
@@ -1524,27 +1719,40 @@ struct ResultView: View {
                 .padding(.horizontal, 20)
             }
 
-            if let mh = myHorse {
-                VStack(spacing: 3) {
-                    Text("SENİN ATIN")
+            if !myHorses.isEmpty {
+                VStack(spacing: 4) {
+                    Text(myHorses.count > 1 ? "SENİN ATLARIN" : "SENİN ATIN")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(Theme.inkSoft)
-                    Text(mh.name)
-                        .font(.system(size: 16, weight: .heavy, design: .monospaced))
-                        .foregroundColor(mh.tier.color)
-                    if mh.willBoom {
-                        Text("💥 PİSTTE PATLADI!")
-                            .font(.system(size: 12, weight: .heavy, design: .monospaced))
-                            .foregroundColor(Theme.accentRed)
-                    } else {
-                        Text("\(mh.placement). sırada bitti")
-                            .font(.system(size: 12, weight: .heavy, design: .monospaced))
-                            .foregroundColor(Theme.inkSoft)
+                    ForEach(myHorses) { mh in
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(mh.name)
+                                    .font(.system(size: 14, weight: .heavy, design: .monospaced))
+                                    .foregroundColor(mh.tier.color)
+                                    .lineLimit(1).minimumScaleFactor(0.8)
+                                if mh.willBoom {
+                                    Text("💥 PİSTTE PATLADI!")
+                                        .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                                        .foregroundColor(Theme.accentRed)
+                                } else {
+                                    Text("\(mh.placement). sırada bitti")
+                                        .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                                        .foregroundColor(Theme.inkSoft)
+                                }
+                            }
+                            Spacer()
+                            if let bet = engine.raceBets[mh.id] {
+                                Text(String(format: "%.1f ₺", bet))
+                                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                                    .foregroundColor(Theme.inkBlack)
+                            }
+                        }
+                        .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Theme.card)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.line, lineWidth: 1))
                     }
                 }
-                .padding(10).frame(maxWidth: .infinity)
-                .background(Theme.card)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.line, lineWidth: 1))
                 .padding(.horizontal, 20)
             }
 
